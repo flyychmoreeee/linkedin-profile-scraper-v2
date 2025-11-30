@@ -22,37 +22,22 @@ class LinkedInScraper:
         self.driver = None
         
     def _init_driver(self):
-        """Inisialisasi Selenium WebDriver - Optimized untuk Docker & Ubuntu 24.04"""
+        """Inisialisasi Selenium WebDriver"""
         chrome_options = Options()
-        
-        # Headless mode (new method untuk Chrome 120+)
-        chrome_options.add_argument("--headless=new")
-        
-        # Docker & Linux optimizations
+        chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        
-        # Window size untuk headless
-        chrome_options.add_argument("--window-size=1920,1080")
-        
-        # Anti-detection
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
-        
-        # Performance optimizations
-        prefs = {"profile.managed_default_content_settings.images": 2}
-        chrome_options.add_experimental_option("prefs", prefs)
+        chrome_options.add_argument("--disable-images")
         chrome_options.add_argument("--disable-plugins")
         chrome_options.add_argument("--disable-extensions")
         
-        # Logging suppression
+        # Suppress Chrome logging
         chrome_options.add_argument("--log-level=3")
-        
-        # User-Agent untuk menghindari deteksi headless
-        chrome_options.add_argument(
-            "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        chrome_options.add_argument("--silent")
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
         self.driver = webdriver.Chrome(options=chrome_options)
         

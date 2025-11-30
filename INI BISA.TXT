@@ -1,11 +1,13 @@
 import json
 import time
+import os
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from typing import Dict, Optional, List
+import google.generativeai as genai
 
 
 class LinkedInScraper:
@@ -22,7 +24,7 @@ class LinkedInScraper:
     def _init_driver(self):
         """Inisialisasi Selenium WebDriver"""
         chrome_options = Options()
-        #chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -100,10 +102,15 @@ class LinkedInScraper:
             Dictionary berisi data profil
         """
         try:
+            print(f"\n{'='*60}")
+            print(f"[SCRAPER] Starting profile scrape for: {vanity_name}")
+            print(f"{'='*60}\n")
+            
             self._init_driver()
             self._set_cookie()
             
             profile_url = f"https://www.linkedin.com/in/{vanity_name}/"
+            print(f"[SCRAPER] Loading URL: {profile_url}")
             self.driver.get(profile_url)
             
             # Wait for profile content to load
@@ -117,9 +124,10 @@ class LinkedInScraper:
                 time.sleep(3)
             
             # Progressive scroll untuk trigger lazy loading semua section
-            print("Scrolling to load all sections...")
+            print("[SCRAPER] Scrolling to load all sections...")
             for i in range(5):
                 self._scroll_and_wait(600, 1.0)
+                print(f"[SCRAPER] Scroll iteration {i+1}/5 completed")
             
             # Scroll back to top
             self.driver.execute_script("window.scrollTo(0, 0);")
@@ -127,10 +135,16 @@ class LinkedInScraper:
             
             profile_data = self._extract_profile_data()
             
+            print(f"\n[SCRAPER] Profile extraction completed")
+            print(f"[SCRAPER] Response: {json.dumps(profile_data, indent=2, ensure_ascii=False)}\n")
+            
             return profile_data
             
         except Exception as e:
-            print(f"Error scraping profile: {str(e)}")
+            error_msg = f"Error scraping profile: {str(e)}"
+            print(f"\n[SCRAPER ERROR] {error_msg}")
+            import traceback
+            print(f"[SCRAPER TRACEBACK]\n{traceback.format_exc()}\n")
             return {
                 "data": {},
                 "message": f"Error: {str(e)}"
@@ -174,8 +188,40 @@ class LinkedInScraper:
             
             # About
             try:
-                about_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[2]/div[3]/div/div/div/span[1]")
-                profile_data["about"] = self._clean_text(about_elem.text)
+                about_text = None
+                
+                # Coba klik tombol "lihat lebih banyak" untuk section[3]
+                try:
+                    see_more_btn = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[3]/div[3]//button[contains(text(), 'lihat lebih banyak') or contains(text(), 'see more')]")
+                    self.driver.execute_script("arguments[0].click();", see_more_btn)
+                    time.sleep(1)
+                except:
+                    pass
+                
+                # Coba extract dari section[3] terlebih dahulu
+                try:
+                    about_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[3]/div[3]/div/div/div/span[1]")
+                    about_text = self._clean_text(about_elem.text)
+                except:
+                    pass
+                
+                # Jika section[3] tidak ada, coba klik tombol "lihat lebih banyak" untuk section[2]
+                if not about_text:
+                    try:
+                        see_more_btn = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[2]/div[3]//button[contains(text(), 'lihat lebih banyak') or contains(text(), 'see more')]")
+                        self.driver.execute_script("arguments[0].click();", see_more_btn)
+                        time.sleep(1)
+                    except:
+                        pass
+                    
+                    # Extract dari section[2]
+                    try:
+                        about_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[2]/div[3]/div/div/div/span[1]")
+                        about_text = self._clean_text(about_elem.text)
+                    except:
+                        pass
+                
+                profile_data["about"] = about_text if about_text else None
             except:
                 profile_data["about"] = None
             
@@ -183,7 +229,22 @@ class LinkedInScraper:
             profile_data["experiences"] = self._extract_experiences()
             profile_data["educations"] = self._extract_education()
             profile_data["certifications"] = self._extract_certifications()
-            profile_data["skills"] = self._extract_skills()
+            
+            # Extract skills dengan fallback ke AI generation
+            skills = self._extract_skills()
+            if not skills:
+                print("[SKILLS] Ekstraksi skills gagal, mencoba generate dengan AI...")
+                skills = self._generate_skills_with_ai(
+                    headline=profile_data.get("headline", ""),
+                    about=profile_data.get("about", ""),
+                    experiences=profile_data.get("experiences", [])
+                )
+                if skills:
+                    print(f"[SKILLS] AI generation berhasil: {skills}")
+                else:
+                    print("[SKILLS] AI generation juga gagal")
+            
+            profile_data["skills"] = skills
             
             data["data"] = profile_data
             return data
@@ -196,17 +257,20 @@ class LinkedInScraper:
         """Extract pengalaman kerja dengan handling duplikasi LinkedIn"""
         experiences = []
         try:
+            print(f"\n[EXTRACT_EXP] Starting experience extraction...")
+            
             # Wait for sections to be available
             try:
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_all_elements_located((By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section"))
                 )
-            except:
-                print("⚠ Timeout waiting for sections")
+                print("[EXTRACT_EXP] Sections loaded successfully")
+            except Exception as wait_err:
+                print(f"[EXTRACT_EXP] ⚠ Timeout waiting for sections: {str(wait_err)}")
             
             # Cari semua section untuk detect experience
             sections = self.driver.find_elements(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section")
-            print(f"Found {len(sections)} total sections")
+            print(f"[EXTRACT_EXP] Found {len(sections)} total sections")
             
             exp_section_idx = None
             
@@ -298,24 +362,32 @@ class LinkedInScraper:
                     print(f"Error parsing experience item {idx}: {str(e)}")
                     
         except Exception as e:
-            print(f"Error extracting experiences: {str(e)}")
+            print(f"[EXTRACT_EXP] Error extracting experiences: {str(e)}")
+            import traceback
+            print(f"[EXTRACT_EXP] Traceback: {traceback.format_exc()}")
         
+        print(f"[EXTRACT_EXP] Extraction completed. Total experiences found: {len(experiences)}")
+        print(f"[EXTRACT_EXP] Experiences data: {json.dumps(experiences, indent=2, ensure_ascii=False)}\n")
         return experiences
     
     def _extract_education(self) -> List[Dict]:
         """Extract pendidikan dengan handling duplikasi LinkedIn"""
         education = []
         try:
+            print(f"\n[EXTRACT_EDU] Starting education extraction...")
+            
             # Wait for sections
             try:
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_all_elements_located((By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section"))
                 )
-            except:
-                pass
+                print("[EXTRACT_EDU] Sections loaded successfully")
+            except Exception as wait_err:
+                print(f"[EXTRACT_EDU] ⚠ Timeout waiting for sections: {str(wait_err)}")
             
             # Cari education section
             sections = self.driver.find_elements(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section")
+            print(f"[EXTRACT_EDU] Found {len(sections)} total sections")
             edu_section_idx = None
             
             for idx, section in enumerate(sections, start=1):
@@ -397,8 +469,12 @@ class LinkedInScraper:
                     print(f"Error parsing education item {idx}: {str(e)}")
                     
         except Exception as e:
-            print(f"Error extracting education: {str(e)}")
+            print(f"[EXTRACT_EDU] Error extracting education: {str(e)}")
+            import traceback
+            print(f"[EXTRACT_EDU] Traceback: {traceback.format_exc()}")
         
+        print(f"[EXTRACT_EDU] Extraction completed. Total educations found: {len(education)}")
+        print(f"[EXTRACT_EDU] Educations data: {json.dumps(education, indent=2, ensure_ascii=False)}\n")
         return education
     
     def _extract_certifications(self) -> List[Dict]:
@@ -456,25 +532,46 @@ class LinkedInScraper:
             
             for idx, item in enumerate(cert_items):
                 try:
-                    visible_spans = item.find_elements(By.XPATH, ".//span[@aria-hidden='true']")
-                    texts = []
+                    cert_data = {}
                     
-                    for span in visible_spans:
-                        text = self._clean_text(span.text)
-                        if text and text not in texts:
-                            texts.append(text)
+                    # Extract name
+                    try:
+                        name_elem = item.find_element(By.XPATH, ".//div/div[2]/div[1]/a/div/div/div/div/span[1]")
+                        cert_data["name"] = self._clean_text(name_elem.text)
+                    except:
+                        try:
+                            name_elem = item.find_element(By.XPATH, ".//span[@aria-hidden='true']")
+                            cert_data["name"] = self._clean_text(name_elem.text)
+                        except:
+                            cert_data["name"] = None
                     
-                    # Pattern: [name, authority, issued_date, credential_id]
-                    if len(texts) >= 4:
-                        certifications.append({
-                            "name": texts[0],
-                            "authority": texts[1],
-                            "issued": texts[2],
-                            "credential_id": texts[3]
-                        })
-                        print(f"✓ Certification {idx}: {texts[0]}")
+                    # Extract authority
+                    try:
+                        authority_elem = item.find_element(By.XPATH, ".//div/div[2]/div[1]/a/span[1]/span[1]")
+                        cert_data["authority"] = self._clean_text(authority_elem.text)
+                    except:
+                        cert_data["authority"] = None
+                    
+                    # Extract issued date
+                    try:
+                        issued_elem = item.find_element(By.XPATH, ".//div/div[2]/div[1]/a/span[2]/span[1]")
+                        cert_data["issued"] = self._clean_text(issued_elem.text)
+                    except:
+                        cert_data["issued"] = None
+                    
+                    # Extract credential ID
+                    try:
+                        credential_elem = item.find_element(By.XPATH, ".//div/div[2]/div[1]/a/span[3]/span[1]")
+                        cert_data["credential_id"] = self._clean_text(credential_elem.text)
+                    except:
+                        cert_data["credential_id"] = None
+                    
+                    # Hanya tambahkan jika ada name
+                    if cert_data.get("name"):
+                        certifications.append(cert_data)
+                        print(f"✓ Certification {idx}: {cert_data['name']}")
                     else:
-                        print(f"✗ Certification {idx} skipped - insufficient data")
+                        print(f"✗ Certification {idx} skipped - no name found")
                         
                 except Exception as e:
                     print(f"Error parsing certification item {idx}: {str(e)}")
@@ -483,6 +580,57 @@ class LinkedInScraper:
             print(f"Error extracting certifications: {str(e)}")
         
         return certifications
+    
+    def _generate_skills_with_ai(self, headline: str, about: str, experiences: List[Dict]) -> str:
+        """Generate skills menggunakan Gemini API berdasarkan headline, about, dan experience"""
+        try:
+            gemini_api_key = os.getenv("GEMINI_API_KEY")
+            if not gemini_api_key:
+                print("⚠ GEMINI_API_KEY tidak diset, skip AI generation")
+                return ""
+            
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            
+            # Siapkan context dari experiences
+            experience_text = ""
+            if experiences:
+                for exp in experiences[:5]:  # Ambil 5 experience terakhir
+                    exp_text = f"- {exp.get('title', '')}"
+                    if exp.get('company'):
+                        exp_text += f" di {exp['company']}"
+                    if exp.get('description'):
+                        exp_text += f": {exp['description'][:100]}"
+                    experience_text += exp_text + "\n"
+            
+            # Buat prompt untuk Gemini
+            prompt = f"""Based on the following LinkedIn profile information, generate a list of relevant skills.
+
+Headline: {headline}
+
+About: {about}
+
+Experience:
+{experience_text}
+
+Provide the response in the format: skill1|skill2|skill3|skill4|skill5
+
+Only include relevant and specific skills, with no additional explanation. Maximum 10 skills."""
+            
+            print("[AI] Generating skills dengan Gemini...")
+            response = model.generate_content(prompt)
+            
+            if response.text:
+                skills_text = response.text.strip()
+                print(f"[AI] Generated skills: {skills_text}")
+                return skills_text
+            else:
+                print("[AI] Gemini response kosong")
+                return ""
+                
+        except Exception as e:
+            print(f"[AI ERROR] Error generating skills: {str(e)}")
+            return ""
     
     def _extract_skills(self) -> str:
         """Extract skills dari halaman details/skills/"""
