@@ -1,0 +1,36 @@
+# Systemd Service untuk LinkedIn Scraper
+# Copy ke: /etc/systemd/system/linkedin-scraper.service
+# Enable: sudo systemctl enable linkedin-scraper
+# Start: sudo systemctl start linkedin-scraper
+# Status: sudo systemctl status linkedin-scraper
+
+[Unit]
+Description=LinkedIn Scraper API Service
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Ganti /opt/linkedin-scraper dengan path project Anda
+WorkingDirectory=/opt/linkedin-scraper
+
+# Start command
+ExecStart=/usr/local/bin/docker-compose up -d
+
+# Stop command
+ExecStop=/usr/local/bin/docker-compose down
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+
+# User yang menjalankan service
+User=root
+
+# Environment
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,460 @@
+import json
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from typing import Dict, Optional, List
+import threading
+from queue import Queue
+
+
+class BrowserPool:
+    """Pool untuk reuse browser instances"""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance.pool = Queue(maxsize=3)
+                    cls._instance.initialized = False
+        return cls._instance
+    
+    def get_driver(self):
+        """Ambil driver dari pool atau buat baru"""
+        try:
+            return self.pool.get_nowait()
+        except:
+            return self._create_driver()
+    
+    def return_driver(self, driver):
+        """Kembalikan driver ke pool"""
+        try:
+            self.pool.put_nowait(driver)
+        except:
+            driver.quit()
+    
+    def _create_driver(self):
+        """Buat driver baru"""
+        chrome_options = Options()
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        chrome_options.add_argument("--disable-images")  # Jangan load gambar untuk lebih cepat
+        chrome_options.add_argument("--disable-plugins")
+        chrome_options.add_argument("--disable-extensions")
+        
+        return webdriver.Chrome(options=chrome_options)
+    
+    def close_all(self):
+        """Tutup semua driver di pool"""
+        while not self.pool.empty():
+            try:
+                driver = self.pool.get_nowait()
+                driver.quit()
+            except:
+                pass
+
+
+class LinkedInScraper:
+    def __init__(self, li_at_cookie: str, use_pool: bool = True):
+        """
+        Inisialisasi LinkedIn Scraper dengan li_at cookie
+        
+        Args:
+            li_at_cookie: LinkedIn session cookie (li_at value)
+            use_pool: Gunakan browser pool untuk reuse instances (default: True)
+        """
+        self.li_at_cookie = li_at_cookie
+        self.driver = None
+        self.use_pool = use_pool
+        self.browser_pool = BrowserPool() if use_pool else None
+        
+    def _init_driver(self):
+        """Inisialisasi Selenium WebDriver"""
+        if self.use_pool:
+            self.driver = self.browser_pool.get_driver()
+        else:
+            chrome_options = Options()
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_argument("--disable-images")
+            chrome_options.add_argument("--disable-plugins")
+            chrome_options.add_argument("--disable-extensions")
+            self.driver = webdriver.Chrome(options=chrome_options)
+        
+    def _set_cookie(self):
+        """Set li_at cookie ke browser"""
+        # Check apakah cookie sudah ada
+        try:
+            existing_cookie = self.driver.get_cookie("li_at")
+            if existing_cookie and existing_cookie.get("value") == self.li_at_cookie:
+                return  # Cookie sudah valid, skip
+        except:
+            pass
+        
+        # Jika belum ada, set cookie
+        self.driver.get("https://www.linkedin.com")
+        
+        # Wait untuk page load dengan timeout lebih singkat
+        try:
+            WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+        except:
+            pass
+        
+        self.driver.add_cookie({
+            "name": "li_at",
+            "value": self.li_at_cookie,
+            "domain": ".linkedin.com"
+        })
+    
+    def _clean_text(self, text: str) -> Optional[str]:
+        """Bersihkan text dari duplikasi dan whitespace"""
+        if not text:
+            return None
+        
+        # Split by newline dan hapus duplikasi
+        lines = text.split('\n')
+        cleaned_lines = []
+        prev_line = None
+        
+        for line in lines:
+            line = line.strip()
+            if line and line != prev_line:
+                cleaned_lines.append(line)
+                prev_line = line
+        
+        result = '\n'.join(cleaned_lines).strip()
+        return result if result else None
+    
+    def scrape_profile(self, vanity_name: str) -> Dict:
+        """
+        Scrape profil LinkedIn berdasarkan vanity name
+        
+        Args:
+            vanity_name: Vanity name LinkedIn (contoh: naufal-arga-a5b22b2aa)
+            
+        Returns:
+            Dictionary berisi data profil
+        """
+        try:
+            self._init_driver()
+            self._set_cookie()
+            
+            # Buka profil LinkedIn
+            profile_url = f"https://www.linkedin.com/in/{vanity_name}/"
+            self.driver.get(profile_url)
+            
+            # Wait untuk halaman load dengan explicit wait
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//*[@id='profile-content']"))
+                )
+            except:
+                time.sleep(2)  # Fallback jika element tidak ditemukan
+            
+            # Extract data profil
+            profile_data = self._extract_profile_data()
+            
+            return profile_data
+            
+        except Exception as e:
+            print(f"Error scraping profile: {str(e)}")
+            return {
+                "data": {},
+                "message": f"Error: {str(e)}"
+            }
+        finally:
+            if self.driver and self.use_pool:
+                self.browser_pool.return_driver(self.driver)
+            elif self.driver:
+                self.driver.quit()
+    
+    def _extract_profile_data(self) -> Dict:
+        """Extract data dari halaman profil LinkedIn menggunakan XPath"""
+        data = {
+            "data": {},
+            "message": "ok"
+        }
+        
+        try:
+            profile_data = {}
+            
+            # Full Name - XPath: /html/body/div[7]/div[3]/div/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[1]/div[1]/span[1]/a/h1
+            try:
+                name_elem = self.driver.find_element(By.XPATH, "/html/body/div[6]/div[3]/div/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[1]/div[1]/span[1]/a/h1")
+                full_name = self._clean_text(name_elem.text)
+                profile_data["full_name"] = full_name
+            except:
+                profile_data["full_name"] = None
+            
+            # Headline - XPath: //*[@id="profile-content"]/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[1]/div[2]
+            try:
+                headline_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[1]/div[2]")
+                headline = self._clean_text(headline_elem.text)
+                profile_data["headline"] = headline
+            except:
+                profile_data["headline"] = None
+            
+            # Location - XPath: //*[@id="profile-content"]/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[2]/span[1]
+            try:
+                location_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[1]/div[2]/div[2]/div[2]/span[1]")
+                location = self._clean_text(location_elem.text)
+                profile_data["location"] = location
+            except:
+                profile_data["location"] = None
+            
+            # About - XPath: //*[@id="profile-content"]/div/div[2]/div/div/main/section[2]/div[3]/div/div/div/span[1]
+            try:
+                about_elem = self.driver.find_element(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[2]/div[3]/div/div/div/span[1]")
+                about = self._clean_text(about_elem.text)
+                profile_data["about"] = about
+            except:
+                profile_data["about"] = None
+            
+            # Profile picture
+            try:
+                img_elem = self.driver.find_element(By.CSS_SELECTOR, "img.profile-photo-edit__preview")
+                profile_data["profile_image_url"] = img_elem.get_attribute("src")
+            except:
+                profile_data["profile_image_url"] = None
+            
+            # Experience
+            profile_data["experiences"] = self._extract_experiences()
+            
+            # Education
+            profile_data["educations"] = self._extract_education()
+            
+            # Certifications
+            profile_data["certifications"] = self._extract_certifications()
+            
+            # Skills
+            profile_data["skills"] = self._extract_skills()
+            
+            data["data"] = profile_data
+            return data
+            
+        except Exception as e:
+            print(f"Error extracting profile data: {str(e)}")
+            return data
+    
+    def _extract_experiences(self) -> List[Dict]:
+        """Extract pengalaman kerja dengan XPath yang akurat"""
+        experiences = []
+        try:
+            # Scroll ke section experience
+            self.driver.execute_script("window.scrollBy(0, 500);")
+            
+            # Wait untuk experience section load
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[4]"))
+                )
+            except:
+                time.sleep(1)
+            
+            # XPath untuk experience items: //*[@id="profile-content"]/div/div[2]/div/div/main/section[4]/div[3]/ul/li
+            exp_items = self.driver.find_elements(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li")
+            
+            for idx, item in enumerate(exp_items):
+                try:
+                    exp_data = {}
+                    
+                    # Job Title - XPath: .//div/div[2]/div/a/span[1]/span[1]
+                    try:
+                        title_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li[{idx+1}]/div/div[2]/div/a/span[1]/span[1]"
+                        title_elem = self.driver.find_element(By.XPATH, title_xpath)
+                        exp_data["title"] = self._clean_text(title_elem.text)
+                    except:
+                        exp_data["title"] = None
+                    
+                    # Company - XPath: .//div/div[2]/div/a/div/div/div/div/span[1]
+                    try:
+                        company_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li[{idx+1}]/div/div[2]/div/a/div/div/div/div/span[1]"
+                        company_elem = self.driver.find_element(By.XPATH, company_xpath)
+                        exp_data["company"] = self._clean_text(company_elem.text)
+                    except:
+                        exp_data["company"] = None
+                    
+                    # Job Type - XPath: .//div/div[2]/div/a/span[2]/span[1]
+                    try:
+                        job_type_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li[{idx+1}]/div/div[2]/div/a/span[2]/span[1]"
+                        job_type_elem = self.driver.find_element(By.XPATH, job_type_xpath)
+                        exp_data["job_type"] = self._clean_text(job_type_elem.text)
+                    except:
+                        exp_data["job_type"] = None
+                    
+                    # Date Range - XPath: .//div/div[2]/div/a/span[2]/span[1] (bisa sama dengan job_type)
+                    try:
+                        date_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li[{idx+1}]/div/div[2]/div/a/span[2]/span[1]"
+                        date_elem = self.driver.find_element(By.XPATH, date_xpath)
+                        exp_data["date_range"] = self._clean_text(date_elem.text)
+                    except:
+                        exp_data["date_range"] = None
+                    
+                    # Location/Duration - XPath: .//div/div[2]/div/a/span[3]/span[1]
+                    try:
+                        location_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[4]/div[3]/ul/li[{idx+1}]/div/div[2]/div/a/span[3]/span[1]"
+                        location_elem = self.driver.find_element(By.XPATH, location_xpath)
+                        exp_data["location"] = self._clean_text(location_elem.text)
+                    except:
+                        exp_data["location"] = None
+                    
+                    if exp_data.get("title"):
+                        experiences.append(exp_data)
+                        
+                except Exception as e:
+                    print(f"Error parsing experience item {idx}: {str(e)}")
+                    pass
+                    
+        except Exception as e:
+            print(f"Error extracting experiences: {str(e)}")
+        
+        return experiences
+    
+    def _extract_education(self) -> List[Dict]:
+        """Extract pendidikan dengan XPath yang akurat"""
+        education = []
+        try:
+            # XPath untuk education items: //*[@id="profile-content"]/div/div[2]/div/div/main/section[5]/div[3]/ul/li
+            edu_items = self.driver.find_elements(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[5]/div[3]/ul/li")
+            
+            for idx, item in enumerate(edu_items):
+                try:
+                    edu_data = {}
+                    
+                    # School Name - XPath: .//div/div[2]/div[1]/a/div/div/div/div/span[1] 
+                    try:
+                        school_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[5]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/a/div/div/div/div/span[1]"
+                        school_elem = self.driver.find_element(By.XPATH, school_xpath)
+                        edu_data["school"] = self._clean_text(school_elem.text)
+                    except:
+                        edu_data["school"] = None
+                    
+                    # Degree & Field of Study - XPath: .//div/div[2]/div[1]/a/span[1]/span[1]
+                    try:
+                        degree_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[5]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/a/span[1]/span[1]"
+                        degree_elem = self.driver.find_element(By.XPATH, degree_xpath)
+                        edu_data["degree"] = self._clean_text(degree_elem.text)
+                    except:
+                        edu_data["degree"] = None
+                    
+                    # Date Range - XPath: .//div/div[2]/div[1]/a/span[2]/span[1]
+                    try:
+                        date_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[5]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/a/span[2]/span[1]"
+                        date_elem = self.driver.find_element(By.XPATH, date_xpath)
+                        edu_data["date_range"] = self._clean_text(date_elem.text)
+                    except:
+                        edu_data["date_range"] = None
+                    
+                    if edu_data.get("school"):
+                        education.append(edu_data)
+                        
+                except Exception as e:
+                    print(f"Error parsing education item {idx}: {str(e)}")
+                    pass
+                    
+        except Exception as e:
+            print(f"Error extracting education: {str(e)}")
+        
+        return education
+    
+    def _extract_certifications(self) -> List[Dict]:
+        """Extract certifications dengan XPath yang akurat"""
+        certifications = []
+        try:
+            # XPath untuk certification items: //*[@id="profile-content"]/div/div[2]/div/div/main/section[6]/div[3]/ul/li
+            cert_items = self.driver.find_elements(By.XPATH, "//*[@id='profile-content']/div/div[2]/div/div/main/section[6]/div[3]/ul/li")
+            
+            for idx, item in enumerate(cert_items):
+                try:
+                    cert_data = {}
+                    
+                    # Certification Name - XPath: .//div/div[2]/div[1]/div/div/div/div/div/span[1]
+                    try:
+                        name_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[6]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/div/div/div/div/div/span[1]"
+                        name_elem = self.driver.find_element(By.XPATH, name_xpath)
+                        cert_data["name"] = self._clean_text(name_elem.text)
+                    except:
+                        cert_data["name"] = None
+                    
+                    # Authority/Issuer - XPath: .//div/div[2]/div[1]/div/span[1]/span[1]
+                    try:
+                        authority_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[6]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/div/span[1]/span[1]"
+                        authority_elem = self.driver.find_element(By.XPATH, authority_xpath)
+                        cert_data["authority"] = self._clean_text(authority_elem.text)
+                    except:
+                        cert_data["authority"] = None
+                    
+                    # Issued Date - XPath: .//div/div[2]/div[1]/div/span[2]/span[1]
+                    try:
+                        issued_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[6]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/div/span[2]/span[1]"
+                        issued_elem = self.driver.find_element(By.XPATH, issued_xpath)
+                        cert_data["issued"] = self._clean_text(issued_elem.text)
+                    except:
+                        cert_data["issued"] = None
+                    
+                    # Credential ID - XPath: .//div/div[2]/div[1]/div/span[3]/span[1]
+                    try:
+                        credential_xpath = f"//*[@id='profile-content']/div/div[2]/div/div/main/section[6]/div[3]/ul/li[{idx+1}]/div/div[2]/div[1]/div/span[3]/span[1]"
+                        credential_elem = self.driver.find_element(By.XPATH, credential_xpath)
+                        cert_data["credential_id"] = self._clean_text(credential_elem.text)
+                    except:
+                        cert_data["credential_id"] = None
+                    
+                    if cert_data.get("name"):
+                        certifications.append(cert_data)
+                        
+                except Exception as e:
+                    print(f"Error parsing certification item {idx}: {str(e)}")
+                    pass
+                    
+        except Exception as e:
+            print(f"Error extracting certifications: {str(e)}")
+        
+        return certifications
+    
+    def _extract_skills(self) -> str:
+        """Extract skills dari halaman details/skills/"""
+        skills = []
+        try:
+            # Navigasi ke halaman skills
+            profile_url = self.driver.current_url
+            skills_url = profile_url.rstrip("/") + "/details/skills/"
+            self.driver.get(skills_url)
+            
+            # Wait untuk skills section load
+            try:
+                WebDriverWait(self.driver, 8).until(
+                    EC.presence_of_element_located((By.XPATH, "/html/body/div[6]/div[3]/div/div/div[2]/div/div/main/section/div[2]/div[2]/div/div/div[1]/ul/li"))
+                )
+            except:
+                time.sleep(1)
+
+            skill_items = self.driver.find_elements(By.XPATH, "/html/body/div[6]/div[3]/div/div/div[2]/div/div/main/section/div[2]/div[2]/div/div/div[1]/ul/li/div/div/div[2]/div[1]/a/div/div/div/div/span[1]")
+            
+            for item in skill_items:
+                try:
+                    skill_text = self._clean_text(item.text)
+                    if skill_text:
+                        skills.append(skill_text)
+                except:
+                    pass
+            
+            # Return sebagai string yang dipisahkan dengan pipe
+            return "|".join(skills) if skills else ""
+            
+        except Exception as e:
+            print(f"Error extracting skills: {str(e)}")
+            return ""
